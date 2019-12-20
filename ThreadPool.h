@@ -1,41 +1,91 @@
-//
-// Created by Fedya on 2019-12-04.
-//
+#ifndef THREAD_POOL_HPP
+#define THREAD_POOL_HPP
 
-#ifndef THREADPOOL_THREADPOOL_H
-#define THREADPOOL_THREADPOOL_H
-
-#include <cstdlib>
-#include <thread>
-#include <vector>
 #include <queue>
+#include <thread>
 #include <mutex>
+#include <condition_variable>
+#include <iostream>
 
-class Task {
-    uint64_t* ptr_;
-    size_t size_;
-
+template<typename Callable>
+class ThreadPool
+{
 public:
-    void Do();
+    using Params = typename Callable::ThreadParams;
+
+    ThreadPool(std::size_t threads, std::vector<Params> &params);
+    ~ThreadPool();
+
+    void EnqueueTask(Callable &&task);
+private:
+    std::size_t              m_threads;
+    std::vector<Params>      &m_params;
+    bool                     m_shouldStop;
+    std::vector<std::thread> m_workers;
+    std::queue<Callable>     m_tasks;
+    std::mutex               m_mutex;
+    std::condition_variable  m_condition;
+    std::condition_variable  m_finishCondition;
+    std::size_t              m_jobSetSize;
+
+    void Worker(Params &params);
 };
 
-class ThreadPool {
-    std::mutex queue_mutex_;
-    std::mutex thread_number_mutex_;
-    std::mutex * mutexes_;
+template<typename Callable>
+ThreadPool<Callable>::ThreadPool(std::size_t threads, std::vector<Params> &params):
+        m_threads{threads},
+        m_params{params},
+        m_shouldStop{false}
+{
+    for (std::size_t i = 0; i < threads; ++i)
+    {
+        m_workers.emplace_back([this, i] { this->Worker(m_params[i]); });
+    }
+}
 
-    const size_t size_;
-    size_t free_threads_;
-    std::queue <Task> queue_;
-    std::vector <std::thread> threads_;
+template<typename Callable>
+ThreadPool<Callable>::~ThreadPool()
+{
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_shouldStop = true;
+    }
+    m_condition.notify_all();
+    for(auto &worker : m_workers)
+    {
+        worker.join();
+    }
+}
 
-public:
-    explicit ThreadPool(size_t size);
-    ~ThreadPool() = default;
+template<typename Callable>
+void ThreadPool<Callable>::EnqueueTask(Callable &&task)
+{
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_tasks.emplace(task);
+    }
+    m_condition.notify_one();
+}
 
-    void Work(std::queue <Task>& queue);
-};
+template<typename Callable>
+void ThreadPool<Callable>::Worker(Params &params)
+{
+    for (;;)
+    {
+        Callable task;
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_condition.wait(lock, [this] { return m_shouldStop || !m_tasks.empty(); });
+            if (m_shouldStop && m_tasks.empty()) {
+                return;
+            }
 
+            task = std::move(m_tasks.front());
+            m_tasks.pop();
+        }
 
+        task(params);
+    }
+}
 
-#endif //THREADPOOL_THREADPOOL_H
+#endif //THREAD_POOL_HPP
